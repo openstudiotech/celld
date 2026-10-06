@@ -1298,6 +1298,8 @@ fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
 
 const ABANDONED_INPUT_GATE: &str = "the cell's critical section ended without releasing";
 const RETIRED_INPUT_GATE: &str = "the cell event ended before it could acquire an input gate";
+const RETIRED_OPERATION: &str =
+    "the request that started this work has ended, so it cannot perform I/O";
 
 /// Release one completed block and remove the open gate from the process map.
 fn release_cell_gate(cell: &str, event: celld_logic::gate::EventId, outcome: Result<(), String>) {
@@ -3827,26 +3829,41 @@ impl InFlight {
     /// Give an op to the event whose continuation enqueued it.
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
-    /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone can never run the continuation again, so its
-    /// resolver goes with the op, exactly as `abandon` drops this event's own.
+    /// is cancelled and this event's retirement cannot take it away.
+    ///
+    /// An owner that is already gone has not stopped running: this very turn
+    /// resumed its continuation, which is how the op came to exist. A cell
+    /// event keeps it, as workerd's one `IoContext` per object does: the
+    /// continuation typically awaits its result to answer a later event of
+    /// the same cell — a Cap'n Web read loop woken by a `message` — and the
+    /// op's gate was already sampled against this event, since
+    /// `event_context` falls back to the running turn. Dropping the resolver
+    /// hung it silently. Stateless work has no object to borrow, so the op
+    /// answers an error instead. Either way the op comes back for this event
+    /// to drive, and `abandon` reaches its resolver.
     fn hand_op(
         &mut self,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
-    ) {
+    ) -> Option<(asyncrt::OpFuture, asyncrt::OpLifetime)> {
         // One branch for both refusals — an owner that is already gone, and
         // one whose mailbox closed while this turn ran. Splitting them let the
-        // second forget to drop the resolver, which is the whole defect.
-        let delivered = self
-            .runtime_state
-            .io_context(owner)
-            .is_some_and(|context| context.hand_op(id, future, lifetime));
-        if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+        // second forget the op, which is the whole defect.
+        let (future, lifetime) = match self.runtime_state.io_context(owner) {
+            Some(context) => match context.hand_op(id, future, lifetime) {
+                Ok(()) => return None,
+                Err(refused) => refused,
+            },
+            None => (future, lifetime),
+        };
+        if self.scope.is_some() {
+            return Some((future, lifetime));
         }
+        let refused: asyncrt::OpFuture =
+            Box::pin(std::future::ready(Err(RETIRED_OPERATION.to_string())));
+        Some((refused, asyncrt::OpLifetime::Handler))
     }
 
     /// Take the ops another turn enqueued for this event, and record them as
@@ -4467,10 +4484,13 @@ fn adopt(entry: &mut InFlight) -> Vec<Op> {
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
-        if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
-            continue;
-        }
+        let (future, lifetime) = match owner.filter(|owner| Some(*owner) != mine) {
+            Some(owner) => match entry.hand_op(owner, id, future, lifetime) {
+                Some(kept) => kept,
+                None => continue,
+            },
+            None => (future, lifetime),
+        };
         entry.ops.insert(id);
         if lifetime == asyncrt::OpLifetime::IoContext {
             entry.io_context_ops.insert(id);
@@ -10966,14 +10986,17 @@ impl IoContext {
 
     /// Take an op that another event's turn enqueued for this event.
     ///
-    /// Reports whether the mailbox accepted it. A closed mailbox refuses, and
-    /// the caller must then drop the op's resolver: this event will never run
-    /// the continuation waiting on it.
-    #[must_use]
-    fn hand_op(&self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> bool {
+    /// A closed mailbox refuses and gives the op back, and the caller must
+    /// then answer it: this event's driver will never poll it.
+    fn hand_op(
+        &self,
+        id: u64,
+        future: asyncrt::OpFuture,
+        lifetime: asyncrt::OpLifetime,
+    ) -> Result<(), (asyncrt::OpFuture, asyncrt::OpLifetime)> {
         let mut handed = self.handed.lock().unwrap();
         let Some(queue) = handed.as_mut() else {
-            return false;
+            return Err((future, lifetime));
         };
         queue.push((id, future, lifetime));
         // Published under the lock, so a reader that sees this count can take
@@ -10981,7 +11004,7 @@ impl IoContext {
         self.handed_len.store(queue.len(), Ordering::Release);
         drop(handed);
         self.handed_wake.notify_one();
-        true
+        Ok(())
     }
 
     /// Whether a foreign turn has left this event an op, without locking.
@@ -11314,11 +11337,13 @@ impl IoContextRegistryForTest {
     /// only stores it, so nothing here polls it.
     #[doc(hidden)]
     pub fn hand_pending_op(&self, context: &Arc<IoContext>, id: u64) -> bool {
-        context.hand_op(
-            id,
-            Box::pin(std::future::pending()),
-            asyncrt::OpLifetime::Handler,
-        )
+        context
+            .hand_op(
+                id,
+                Box::pin(std::future::pending()),
+                asyncrt::OpLifetime::Handler,
+            )
+            .is_ok()
     }
 
     /// The op ids `context` still holds for a driver that has not taken them.
