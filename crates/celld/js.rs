@@ -9594,13 +9594,22 @@ fn op_gate_acquire(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let event = NEXT_GATE_EVENT.fetch_add(1, Ordering::Relaxed);
-    let contexts = current_reaction_io_context(scope).zip(
-        operation_continuation_id(scope).and_then(|id| actor_runtime_state(scope).io_context(id)),
-    );
+    let owner_context =
+        operation_continuation_id(scope).and_then(|id| actor_runtime_state(scope).io_context(id));
+    // A promise can retain user code after its event has retired, and a later
+    // event of the same cell can resume it: a read loop woken by a `message`.
+    // That event drives the block, so it is the origin too, as workerd's one
+    // `IoContext` per object would be. An event of another cell sharing the
+    // isolate must not lend its context.
+    let contexts = current_reaction_io_context(scope)
+        .or_else(|| {
+            owner_context.clone().filter(|driver| {
+                current_cell_event(driver).is_some_and(|frame| frame.storage == cell)
+            })
+        })
+        .zip(owner_context);
     let Some((context, owner_context)) = contexts else {
-        // A promise can retain user code after its event has retired. It must
-        // not borrow the context of whichever event happens to run the stale
-        // reaction's checkpoint.
+        // Retired, and no event of this cell is here to drive it.
         let promise = rejected_promise(scope, RETIRED_INPUT_GATE);
         return_gate_acquisition(scope, rv, event, None, promise);
         return;
