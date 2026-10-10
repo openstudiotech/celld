@@ -1,0 +1,21 @@
+# This fork does not take pull requests. One that is opened is closed with a
+# note on where a change belongs.
+name: Pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr close "$PR" --repo "$GITHUB_REPOSITORY" --comment "Thanks, but this fork does not take pull requests. It carries a small patch set on top of denoland/celld until upstream ships the same fix. A change to celld itself belongs upstream at https://github.com/denoland/celld. Something about this fork's patches can go by email to hi@openstudio.tech."
